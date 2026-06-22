@@ -1,7 +1,5 @@
 # Real-Time Graph-Based Financial Fraud Detection Pipeline
 
-> **Status: In Progress** — Architecture complete, implementation ongoing.
-
 ## Problem Statement
 
 Traditional fraud detection systems operate on **batch processing** — transactions are analyzed in bulk at the end of the day. By the time fraud is detected, the money is already gone.
@@ -46,7 +44,7 @@ Instead of looking at transactions one by one, this system models the **entire t
 ┌──────────────────────────┐   ┌──────────────────────────────────┐
 │  LAYER 4A — GRAPH STORE  │   │     LAYER 4B — STRUCTURED STORE  │
 │                          │   │                                   │
-│  Neo4j                   │   │  PostgreSQL                       │
+│  Neo4j                   │   │  Sqlite                           │
 │  · Accounts as nodes     │   │  · Transaction event log          │
 │  · Transactions as edges │   │  · Audit trail                    │
 │  · Cycle detection       │   │  · Operational queries            │
@@ -83,7 +81,7 @@ Instead of looking at transactions one by one, this system models the **entire t
 | Streaming | Apache Kafka | High-throughput, fault-tolerant real-time streaming |
 | Processing | Python | ETL, feature engineering, ML inference |
 | Graph Storage | Neo4j | Relationship-first queries — cycles and clusters |
-| Structured Storage | PostgreSQL | Operational data and audit logging |
+| Structured Storage | **SQLite** (dev) / **PostgreSQL** (prod) | SQLite for development & testing; PostgreSQL for production audit logging & operational data |
 | Visualization | Neo4j Browser | Real-time graph exploration |
 
 ---
@@ -139,6 +137,197 @@ Since real-time fraud labels aren't immediately available:
 
 ---
 
+## Installation
+
+### Prerequisites
+
+Before installing, ensure you have the following installed on your system:
+
+- **Python 3.9+** — [Download](https://www.python.org/downloads/)
+- **Docker & Docker Compose** — [Install Guide](https://docs.docker.com/get-docker/)
+- **Git** — [Download](https://git-scm.com/)
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/yourusername/fraud-detection-pipeline.git
+cd fraud-detection-pipeline
+```
+### 2. Install Python Dependencies
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+**Key Dependencies:**
+- `kafka-python` — Kafka consumer/producer
+- `neo4j` — Neo4j driver
+- `scikit-learn` — Machine learning models
+- `xgboost` — Gradient boosting
+- `pandas` — Data manipulation
+- `numpy` — Numerical computing
+- `psycopg2-binary` — PostgreSQL adapter (for production)
+
+### 3. Start Docker Services
+
+Start Kafka, Neo4j, and PostgreSQL containers:
+
+```bash
+docker-compose up -d
+```
+
+Verify all services are running:
+
+```bash
+docker-compose ps
+```
+
+**Expected Output:**
+```
+CONTAINER ID   IMAGE                              STATUS
+xxxxx          confluentinc/cp-kafka:7.6.0        Up (healthy)
+xxxxx          neo4j:5.18-community               Up (healthy)
+xxxxx          postgres:16-alpine                 Up (healthy)
+```
+
+### 4. Configure Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# Kafka Configuration
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+KAFKA_TOPIC=transactions
+
+# Neo4j Configuration
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=fraudpassword
+
+# PostgreSQL Configuration (for production)
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=fraud_db
+POSTGRES_USER=fraud_user
+POSTGRES_PASSWORD=fraudpassword
+
+# SQLite Configuration (for development)
+DB_PATH=data/fraud_pipeline.db
+```
+
+### 5. Initialize Databases
+
+**Neo4j** — Create indexes for faster queries:
+
+```bash
+# Access Neo4j Browser at http://localhost:7474
+# Username: neo4j
+# Password: fraudpassword
+# Run the queries in graph/fraud_queries.py
+```
+
+**PostgreSQL** — Schema is auto-initialized from `storage/init.sql`
+
+**SQLite** — Database is created automatically on first run
+
+### 8. Download & Prepare Data
+
+Download the PaySim dataset:
+
+```bash
+# Create data directory
+mkdir -p data
+
+# Download PaySim CSV from Kaggle:
+# https://www.kaggle.com/datasets/ealaxi/paysim1
+# Place it as: data/paysim.csv
+```
+
+### 8. Run the Pipeline
+
+**Start the Kafka Producer** (generates transactions):
+
+```bash
+python kafka/producer.py
+```
+
+**In a new terminal, start the Kafka Consumer** (processes transactions):
+
+```bash
+python kafka/consumer.py
+```
+
+**Monitor in Neo4j Browser:**
+
+```
+http://localhost:7474
+```
+
+**View SQLite Data:**
+
+```bash
+python -c "import sqlite3; conn = sqlite3.connect('data/fraud_pipeline.db'); \
+cursor = conn.cursor(); cursor.execute('SELECT * FROM transactions LIMIT 5'); \
+print(cursor.fetchall())"
+```
+
+### 9. (Optional) Train ML Models
+
+Train on PaySim dataset:
+
+```bash
+python ml/train.py 
+```
+
+Evaluate model performance:
+
+```bash
+python ml/evaluate.py
+```
+
+### 9. Run Analytics Dashboard
+
+Start the Flask analytics dashboard:
+
+```bash
+python analytics/dashboard.py
+```
+
+Access at: `http://localhost:5000`
+
+---
+
+## Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| Kafka not connecting | Ensure Docker services are running: `docker-compose ps` |
+| Neo4j authentication failed | Check credentials in `.env` match docker-compose.yaml |
+| SQLite locked error | Close other database connections: `fuser -k data/fraud_pipeline.db` |
+| Models not found | Run `python ml/train.py` to generate pre-trained models |
+| Missing PaySim data | Download from [Kaggle](https://www.kaggle.com/datasets/ealaxi/paysim1) and place in `data/` |
+
+### Reset Everything
+
+If you need to start fresh:
+
+```bash
+# Stop and remove containers
+docker-compose down -v
+
+# Clean Python cache
+rm -rf __pycache__ .pytest_cache
+
+# Remove generated data
+rm -rf data/fraud_pipeline.db data/fraud_alerts.jsonl
+
+# Restart
+docker-compose up -d
+```
+
+---
+
 ## Project Structure (Planned)
 
 ```
@@ -166,7 +355,15 @@ fraud-detection-pipeline/
 │   └── fraud_queries.py          # Cypher queries for pattern detection
 │
 ├── storage/
-│   └── postgres_writer.py        # Write to PostgreSQL
+│   ├── sqlite_writer.py          # Write to SQLite (development)
+│   └── postgres_writer.py        # Write to PostgreSQL (production — prepared)
+│
+├── analytics/
+│   ├── dashboard.py              # Real-time fraud analytics dashboard
+│   ├── scheduler.py              # Periodic fraud pattern scanning
+│   ├── alert_manager.py          # Alert management and notifications
+│   └── templates/
+│       └── dashboard.html        # Web UI for fraud monitoring
 │
 ├── docs/
 │   └── architecture.md           # Detailed architecture notes
@@ -184,7 +381,7 @@ fraud-detection-pipeline/
 | Dataset Strategy | ✅ Complete |
 | ML Design | ✅ Complete |
 | Scalability Design | ✅ Complete |
-| Implementation | 🔄 In Progress |
+| Implementation | ✅ Complete |
 
 ---
 
