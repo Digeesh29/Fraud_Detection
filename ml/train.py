@@ -36,7 +36,9 @@ from ml.evaluate import evaluate_model, print_report
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = Path("models")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = PROJECT_ROOT / "models"
+DEFAULT_CSV = PROJECT_ROOT / "data" / "paysim.csv"
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -247,8 +249,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--csv",
         type=str,
-        required=True,
-        help="Path to PaySim CSV file",
+        default=str(DEFAULT_CSV),
+        help=f"Path to PaySim CSV file (default: {DEFAULT_CSV})",
     )
     parser.add_argument(
         "--max-rows",

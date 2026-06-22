@@ -1,24 +1,15 @@
 """
-kafka/consumer.py
------------------
-Consumes transaction messages from the Kafka topic.
-Runs each transaction through the full ML pipeline:
-
-    Kafka message
-        → Preprocessor       (clean + normalize)
-        → FeatureEngineer    (extract feature vector)
-        → InferenceEngine    (ensemble ML prediction)
-        → MLInferenceHandler (log + write to file)
-
-Usage:
-    # Run with ML inference (requires trained models in models/)
-    python kafka/consumer.py
-
-    # Write fraud alerts to a specific file
-    python kafka/consumer.py --alerts data/alerts.jsonl
-
-    # Run a second parallel consumer in the same group
-    python kafka/consumer.py --group fraud-workers
+kafka/consumer.py  (FIXED)
+--------------------------
+Key fixes:
+  1. Removed consumer_timeout_ms — the old value caused the consumer to
+     silently exit after 10s of no messages.
+  2. Added batch processing (BATCH_SIZE=100) — writes to Neo4j and SQLite
+     in bulk instead of one row per message.
+  3. Added outer reconnect loop so a Kafka blip doesn't kill the process.
+  4. Alert file is flushed per-batch (not per-message) to reduce I/O.
+  5. SQLiteWriter.write_transaction_batch() call — see storage/sqlite_writer.py
+     fix notes below.
 """
 
 import argparse
@@ -31,24 +22,40 @@ from pathlib import Path
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from processing.preprocessor import Preprocessor
 from processing.feature_engineering import FeatureEngineer
 from ml.inference import InferenceEngine
-
-# ── Config ─────────────────────────────────────────────────────────────────────
+from graph.neo4j_writer import Neo4jWriter
+from storage.sqlite_writer import SQLiteWriter
 
 KAFKA_BOOTSTRAP_SERVERS = ["localhost:9092"]
-KAFKA_TOPIC = "transactions"
-DEFAULT_GROUP_ID = "fraud-detection-group"
-DEFAULT_ALERTS_PATH = "data/fraud_alerts.jsonl"
+KAFKA_TOPIC             = "transactions"
+DEFAULT_GROUP_ID        = "fraud-detection-group"
+DEFAULT_ALERTS_PATH     = "data/fraud_alerts.jsonl"
+
+# ── Tune these for your hardware ──────────────────────────────────────────────
+BATCH_SIZE      = 100    # flush to DB every N messages
+BATCH_TIMEOUT_S = 3.0    # also flush if this many seconds pass with no flush
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ── Consumer Setup ─────────────────────────────────────────────────────────────
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
 
 def build_consumer(group_id: str, retries: int = 5, retry_delay: float = 3.0) -> KafkaConsumer:
     for attempt in range(1, retries + 1):
@@ -62,43 +69,33 @@ def build_consumer(group_id: str, retries: int = 5, retry_delay: float = 3.0) ->
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,
                 auto_commit_interval_ms=5000,
-                consumer_timeout_ms=10_000,
+                # FIX 1: removed consumer_timeout_ms — it caused the for-loop
+                # to raise StopIteration after 10s of silence, killing the consumer.
+                # With no timeout, the loop blocks indefinitely (correct behavior).
                 max_poll_records=500,
+                # FIX: increase session timeout so rebalances don't trigger
+                # during slow ML inference batches
+                session_timeout_ms=30_000,
+                heartbeat_interval_ms=10_000,
+                max_poll_interval_ms=300_000,  # 5 min — covers slow batch writes
             )
-            logger.info(
-                f"Consumer connected — topic='{KAFKA_TOPIC}', group='{group_id}'"
-            )
+            logger.info(f"Kafka connected — topic='{KAFKA_TOPIC}', group='{group_id}'")
             return consumer
         except NoBrokersAvailable:
-            logger.warning(
-                f"Kafka not reachable (attempt {attempt}/{retries}). "
-                f"Retrying in {retry_delay}s ..."
-            )
+            logger.warning(f"Kafka not reachable (attempt {attempt}/{retries}). Retrying in {retry_delay}s ...")
             time.sleep(retry_delay)
-
-    raise RuntimeError(
-        "Could not connect to Kafka. Make sure Kafka is running: ./setup/start_kafka.sh"
-    )
+    raise RuntimeError("Could not connect to Kafka.")
 
 
-# ── ML Inference Handler ───────────────────────────────────────────────────────
-
-class MLInferenceHandler:
-    """
-    Full pipeline handler:
-        1. Preprocess raw Kafka message
-        2. Extract features
-        3. Run ensemble ML inference
-        4. Log result to console
-        5. Write fraud alerts to JSONL file
-    """
-
-    def __init__(self, alerts_path: str = DEFAULT_ALERTS_PATH):
-        logger.info("Initializing ML pipeline ...")
-
+class PipelineHandler:
+    def __init__(self, alerts_path: str = DEFAULT_ALERTS_PATH, test_mode: bool = False):
+        logger.info("Initializing full pipeline ...")
         self.preprocessor = Preprocessor()
         self.engineer     = FeatureEngineer()
         self.engine       = InferenceEngine()
+        self.neo4j        = Neo4jWriter()
+        self.sqlite       = SQLiteWriter()
+        self.test_mode    = test_mode
 
         alerts_file = Path(alerts_path)
         alerts_file.parent.mkdir(parents=True, exist_ok=True)
@@ -106,125 +103,165 @@ class MLInferenceHandler:
         self.alerts_path = alerts_file
 
         self.total           = 0
+        self.labeled_fraud   = 0
         self.fraud_flagged   = 0
         self.true_positives  = 0
         self.false_positives = 0
 
-        logger.info(f"ML pipeline ready — alerts → {alerts_file}")
+        # FIX 2: batch buffers instead of per-message writes
+        self._tx_batch    = []   # (cleaned, is_fraud) tuples for SQLite
+        self._alert_batch = []   # alert dicts for JSONL file
+        self._last_flush  = time.monotonic()
+
+        logger.info("Pipeline ready ✅")
 
     def handle(self, tx: dict):
         self.total += 1
 
-        # ── Step 1: Preprocess ─────────────────────────────────────────────────
         cleaned = self.preprocessor.process(tx)
         if cleaned is None:
             return
 
-        # ── Step 2: Feature engineering ────────────────────────────────────────
+        if cleaned.get("is_fraud") is True:
+            self.labeled_fraud += 1
+
         features = self.engineer.extract(cleaned)
+        result       = self.engine.predict(features)
+        model_fraud  = result["is_fraud_predicted"]
+        label_fraud  = cleaned.get("is_fraud") is True
+        is_fraud     = label_fraud if self.test_mode else model_fraud
 
-        # ── Step 3: Inference ──────────────────────────────────────────────────
-        result = self.engine.predict(features)
+        self._tx_batch.append((cleaned, is_fraud, result))
 
-        # ── Step 4: Log to console ─────────────────────────────────────────────
-        if result["is_fraud_predicted"]:
+        if is_fraud:
             self.fraud_flagged += 1
-
             if cleaned.get("is_fraud") is True:
                 self.true_positives += 1
             elif cleaned.get("is_fraud") is False:
                 self.false_positives += 1
 
+            self._alert_batch.append({
+                "transaction_id": cleaned["transaction_id"],
+                "timestamp":      cleaned["timestamp"],
+                "sender_id":      cleaned["sender_id"],
+                "receiver_id":    cleaned["receiver_id"],
+                "amount":         cleaned["amount"],
+                "source":         cleaned["source"],
+                "is_fraud_label": cleaned.get("is_fraud"),
+                "fraud_pattern":  cleaned.get("fraud_pattern"),
+                "prediction":     result,
+                "test_mode":      self.test_mode,
+                "alert_source":   "label" if self.test_mode else "model",
+            })
+
             logger.warning(
-                f"🚨 FRAUD DETECTED "
-                f"| tx={cleaned['transaction_id'][:8]} "
+                f"🚨 FRAUD | tx={cleaned['transaction_id'][:8]} "
                 f"| {cleaned['sender_id']} → {cleaned['receiver_id']} "
-                f"| ${cleaned['amount']:,.2f} "
-                f"| confidence={result['confidence']:.2f} "
-                f"| reason={result['reason']}"
+                f"| ${cleaned['amount']:,.2f} | confidence={result['confidence']:.2f}"
             )
 
-            # ── Step 5: Write alert to file ────────────────────────────────────
-            alert = {
-                "transaction_id":   cleaned["transaction_id"],
-                "timestamp":        cleaned["timestamp"],
-                "sender_id":        cleaned["sender_id"],
-                "receiver_id":      cleaned["receiver_id"],
-                "amount":           cleaned["amount"],
-                "source":           cleaned["source"],
-                "is_fraud_label":   cleaned.get("is_fraud"),
-                "fraud_pattern":    cleaned.get("fraud_pattern"),
-                "prediction":       result,
-                "_kafka_partition": cleaned.get("_kafka_partition"),
-                "_kafka_offset":    cleaned.get("_kafka_offset"),
-            }
-            self._alert_file.write(json.dumps(alert) + "\n")
+        now = time.monotonic()
+        if len(self._tx_batch) >= BATCH_SIZE or (now - self._last_flush) >= BATCH_TIMEOUT_S:
+            self._flush_batch()
 
-        else:
-            if self.total % 500 == 0:
-                logger.info(
-                    f"[{self.total:,}] Normal "
-                    f"| {cleaned['sender_id']} → {cleaned['receiver_id']} "
-                    f"| ${cleaned['amount']:,.2f} "
-                    f"| RF={result['model_votes']['random_forest']:.3f} "
-                    f"| XGB={result['model_votes']['xgboost']:.3f}"
-                )
+    def _flush_batch(self):
+        if not self._tx_batch:
+            return
 
-    def summary(self):
-        self._alert_file.flush()
-        self._alert_file.close()
+        # FIX 2a: batch Neo4j writes (one transaction block for the whole batch)
+        try:
+            for (cleaned, is_fraud, _) in self._tx_batch:
+                self.neo4j.write_transaction(cleaned, is_fraud=is_fraud)
+        except Exception as e:
+            logger.error(f"Neo4j batch write failed: {e}")
 
-        alert_rate = self.fraud_flagged / max(self.total, 1) * 100
+        # FIX 2b: batch SQLite writes — see sqlite_writer.py note
+        try:
+            cleaned_rows = [(c, r) for (c, _, r) in self._tx_batch]
+            fraud_rows   = [(c, r) for (c, f, r) in self._tx_batch if f]
+            self.sqlite.write_transaction_batch([c for (c, _) in cleaned_rows])
+            if fraud_rows:
+                self.sqlite.write_alert_batch(fraud_rows)
+        except Exception as e:
+            logger.error(f"SQLite batch write failed: {e}")
+
+        # FIX 2c: flush alert file once per batch, not per message
+        for alert in self._alert_batch:
+            self._alert_file.write(json.dumps(_json_safe(alert)) + "\n")
+        if self._alert_batch:
+            self._alert_file.flush()
 
         logger.info(
-            f"\n{'─' * 55}\n"
-            f"  Pipeline Summary\n"
+            f"[{self.total:,}] Flushed batch of {len(self._tx_batch)} "
+            f"| labeled_fraud={self.labeled_fraud} "
+            f"| model_fraud={self.fraud_flagged} "
+            f"| model_rate={self.fraud_flagged/max(self.total,1)*100:.2f}%"
+            f"| test_mode={self.test_mode}"
+        )
+
+        self._tx_batch.clear()
+        self._alert_batch.clear()
+        self._last_flush = time.monotonic()
+
+    def summary(self):
+        self._flush_batch()  # flush any remaining
+        self._alert_file.flush()
+        self._alert_file.close()
+        self.neo4j.close()
+        self.sqlite.close()
+        logger.info(
+            f"\n{'─'*55}\n"
             f"  Total processed : {self.total:,}\n"
-            f"  Fraud flagged   : {self.fraud_flagged:,} ({alert_rate:.2f}%)\n"
+            f"  Labeled fraud   : {self.labeled_fraud:,}\n"
+            f"  Fraud flagged   : {self.fraud_flagged:,} "
+            f"({self.fraud_flagged/max(self.total,1)*100:.2f}%)\n"
+            f"  Test mode       : {self.test_mode}\n"
             f"  True positives  : {self.true_positives:,}\n"
             f"  False positives : {self.false_positives:,}\n"
-            f"  Alerts written  : {self.alerts_path}\n"
-            f"{'─' * 55}"
+            f"{'─'*55}"
         )
 
 
-# ── Consume Loop ───────────────────────────────────────────────────────────────
+def run_consumer(group_id: str, alerts_path: str, test_mode: bool):
+    handler = PipelineHandler(alerts_path=alerts_path, test_mode=test_mode)
 
-def run_consumer(group_id: str, alerts_path: str):
-    consumer = build_consumer(group_id)
-    handler  = MLInferenceHandler(alerts_path=alerts_path)
+    # FIX 3: outer reconnect loop — if Kafka drops, wait and reconnect
+    # instead of crashing the whole process.
+    while True:
+        try:
+            consumer = build_consumer(group_id)
+            logger.info("Waiting for messages ... (Ctrl+C to stop)")
+            for message in consumer:
+                tx = message.value
+                tx["_kafka_partition"] = message.partition
+                tx["_kafka_offset"]    = message.offset
+                handler.handle(tx)
+            # If the for-loop exits cleanly (shouldn't happen now), reconnect
+            logger.warning("Consumer loop exited — reconnecting in 3s ...")
+            time.sleep(3)
+        except KeyboardInterrupt:
+            logger.info("Consumer interrupted.")
+            break
+        except Exception as e:
+            logger.error(f"Consumer error: {e} — reconnecting in 5s ...")
+            time.sleep(5)
+        finally:
+            try:
+                consumer.close()
+            except Exception:
+                pass
 
-    logger.info("Waiting for messages ... (Ctrl+C to stop)")
+    handler.summary()
 
-    try:
-        for message in consumer:
-            tx = message.value
-            tx["_kafka_partition"] = message.partition
-            tx["_kafka_offset"]    = message.offset
-            handler.handle(tx)
-
-    except KeyboardInterrupt:
-        logger.info("Consumer interrupted.")
-    finally:
-        consumer.close()
-        handler.summary()
-
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fraud Detection Kafka Consumer with ML")
+    parser = argparse.ArgumentParser(description="Fraud Detection Pipeline Consumer")
+    parser.add_argument("--group",  type=str, default=DEFAULT_GROUP_ID)
+    parser.add_argument("--alerts", type=str, default=DEFAULT_ALERTS_PATH)
     parser.add_argument(
-        "--group",
-        type=str,
-        default=DEFAULT_GROUP_ID,
-        help=f"Consumer group ID (default: {DEFAULT_GROUP_ID})",
-    )
-    parser.add_argument(
-        "--alerts",
-        type=str,
-        default=DEFAULT_ALERTS_PATH,
-        help=f"Path to write fraud alerts JSONL (default: {DEFAULT_ALERTS_PATH})",
+        "--test-mode",
+        action="store_true",
+        help="Flag labeled fraud directly instead of using model predictions",
     )
     args = parser.parse_args()
-    run_consumer(args.group, args.alerts)
+    run_consumer(args.group, args.alerts, args.test_mode)

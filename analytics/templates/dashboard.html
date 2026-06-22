@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fraud Detection Pipeline</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #11172a;
+      --panel-2: #151c30;
+      --border: #27314d;
+      --text: #e5e7eb;
+      --muted: #9aa4bd;
+      --accent: #6ea8fe;
+      --danger: #ff6b7a;
+      --warning: #ffc857;
+      --success: #6be585;
+    }
+    body {
+      background: radial-gradient(circle at top, #162038 0, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .app-shell {
+      min-height: 100vh;
+    }
+    .glass-card {
+      background: rgba(17, 23, 42, 0.88);
+      border: 1px solid var(--border);
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      background: linear-gradient(135deg, rgba(111, 168, 255, 0.15), rgba(255, 107, 122, 0.08));
+      border: 1px solid var(--border);
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .metric-value {
+      font-weight: 700;
+      font-size: 1.7rem;
+      line-height: 1.1;
+    }
+    .soft-border { border-color: var(--border) !important; }
+    .table-dark {
+      --bs-table-bg: transparent;
+      --bs-table-color: var(--text);
+      --bs-table-striped-bg: rgba(255,255,255,0.03);
+      --bs-table-border-color: var(--border);
+    }
+    .live-dot {
+      width: 0.6rem;
+      height: 0.6rem;
+      border-radius: 999px;
+      display: inline-block;
+      background: var(--success);
+      box-shadow: 0 0 0 0 rgba(107, 229, 133, 0.6);
+      animation: pulse 1.5s infinite;
+    }
+    .live-dot.offline {
+      background: var(--warning);
+      box-shadow: 0 0 0 0 rgba(255, 200, 87, 0.6);
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(107, 229, 133, 0.55); }
+      70% { box-shadow: 0 0 0 12px rgba(107, 229, 133, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(107, 229, 133, 0); }
+    }
+    .chart-box { position: relative; height: 280px; }
+    .chart-box.small { height: 240px; }
+    .pattern-badge { text-transform: uppercase; letter-spacing: 0.04em; }
+    .subtle { color: var(--muted); }
+    .divider { border-top: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useRef, useState } = React;
+
+    const initialData = {
+      stats: {},
+      alerts: [],
+      volume: [],
+      alert_volume: [],
+      patterns: [],
+      model: {},
+      scan: null,
+      graph_confirmed: []
+    };
+
+    function formatCurrency(value) {
+      return Number(value || 0).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    }
+
+    function patternClass(pattern) {
+      if (pattern === 'cycle') return 'text-bg-danger';
+      if (pattern === 'ring') return 'text-bg-info';
+      if (pattern === 'burst') return 'text-bg-warning';
+      return 'text-bg-secondary';
+    }
+
+    function confidenceClass(confidence) {
+      if (confidence >= 0.8) return 'text-danger';
+      if (confidence >= 0.5) return 'text-warning';
+      return 'text-success';
+    }
+
+    function MetricCard({ label, value, subtext, tone }) {
+      return (
+        <div className="col-12 col-sm-6 col-xl-2">
+          <div className={`glass-card rounded-4 p-3 h-100 border ${tone || ''}`}>
+            <div className="metric-label">{label}</div>
+            <div className="metric-value mt-2">{value}</div>
+            <div className="small subtle mt-1">{subtext}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [data, setData] = useState(initialData);
+      const [liveState, setLiveState] = useState('LIVE');
+      const timelineCanvasRef = useRef(null);
+      const patternCanvasRef = useRef(null);
+      const timelineChartRef = useRef(null);
+      const patternChartRef = useRef(null);
+
+      const loadData = async () => {
+        const response = await fetch('/api/all');
+        const payload = await response.json();
+        setData(payload);
+      };
+
+      useEffect(() => {
+        const timelineCtx = timelineCanvasRef.current.getContext('2d');
+        const patternCtx = patternCanvasRef.current.getContext('2d');
+
+        timelineChartRef.current = new Chart(timelineCtx, {
+          type: 'line',
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: 'Transactions',
+                data: [],
+                borderColor: '#6ea8fe',
+                backgroundColor: 'rgba(110, 168, 254, 0.12)',
+                tension: 0.35,
+                fill: true,
+                pointRadius: 0,
+                borderWidth: 2,
+              },
+              {
+                label: 'Fraud Alerts',
+                data: [],
+                borderColor: '#ff6b7a',
+                backgroundColor: 'rgba(255, 107, 122, 0.12)',
+                tension: 0.35,
+                fill: true,
+                pointRadius: 0,
+                borderWidth: 2,
+                yAxisID: 'y1',
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { labels: { color: '#cbd5e1' } },
+            },
+            scales: {
+              x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.08)' } },
+              y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.08)' } },
+              y1: { position: 'right', ticks: { color: '#ff6b7a' }, grid: { display: false } },
+            },
+          },
+        });
+
+        patternChartRef.current = new Chart(patternCtx, {
+          type: 'doughnut',
+          data: {
+            labels: [],
+            datasets: [{ data: [], borderWidth: 0, backgroundColor: ['#6ea8fe', '#ff6b7a', '#ffc857', '#6be585', '#a78bfa'] }],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom', labels: { color: '#cbd5e1' } } },
+          },
+        });
+
+        loadData();
+
+        let eventSource;
+        let pollTimer;
+
+        if (typeof EventSource !== 'undefined') {
+          eventSource = new EventSource('/api/stream');
+          eventSource.onmessage = (event) => {
+            setLiveState('LIVE');
+            try {
+              setData(JSON.parse(event.data));
+            } catch (error) {
+              console.error('SSE parse error:', error);
+            }
+          };
+          eventSource.onerror = () => {
+            setLiveState('RECONNECTING');
+          };
+        } else {
+          pollTimer = setInterval(loadData, 5000);
+        }
+
+        return () => {
+          if (eventSource) eventSource.close();
+          if (pollTimer) clearInterval(pollTimer);
+          timelineChartRef.current?.destroy();
+          patternChartRef.current?.destroy();
+        };
+      }, []);
+
+      useEffect(() => {
+        const volume = data.volume || [];
+        const alerts = data.alert_volume || [];
+        const labels = volume.map((row) => {
+          const time = new Date(row.bucket);
+          return `${time.getHours()}:${String(time.getMinutes()).padStart(2, '0')}`;
+        });
+
+        if (timelineChartRef.current) {
+          timelineChartRef.current.data.labels = labels;
+          timelineChartRef.current.data.datasets[0].data = volume.map((row) => row.tx_count);
+          timelineChartRef.current.data.datasets[1].data = labels.map((label) => {
+            const match = alerts.find((row) => {
+              const time = new Date(row.bucket);
+              return `${time.getHours()}:${String(time.getMinutes()).padStart(2, '0')}` === label;
+            });
+            return match ? match.alert_count : 0;
+          });
+          timelineChartRef.current.update('none');
+        }
+
+        if (patternChartRef.current) {
+          const patterns = data.patterns || [];
+          patternChartRef.current.data.labels = patterns.map((item) => item.pattern.toUpperCase());
+          patternChartRef.current.data.datasets[0].data = patterns.map((item) => item.count);
+          patternChartRef.current.update('none');
+        }
+      }, [data]);
+
+      const stats = data.stats || {};
+      const model = data.model || {};
+      const scan = data.scan;
+      const alerts = data.alerts || [];
+      const graphConfirmed = data.graph_confirmed || [];
+
+      const rf = parseFloat(model.avg_rf_score || 0);
+      const xgb = parseFloat(model.avg_xgb_score || 0);
+      const confidence = parseFloat(model.avg_confidence || 0);
+
+      return (
+        <div className="app-shell pb-4">
+          <nav className="navbar navbar-expand-lg navbar-dark glass-card border-bottom soft-border mb-4">
+            <div className="container-fluid px-4 py-3">
+              <div>
+                <div className="navbar-brand fw-bold mb-0">Real-Time Fraud Detection Pipeline</div>
+                <div className="subtle small">React + Bootstrap dashboard for Kafka, Neo4j, SQLite, and ML alerts</div>
+              </div>
+              <div className="d-flex align-items-center gap-3">
+                <span className="small subtle" id="last-updated">Updated live</span>
+                <div className="badge rounded-pill px-3 py-2 bg-dark border border-secondary d-flex align-items-center gap-2">
+                  <span className={`live-dot ${liveState === 'RECONNECTING' ? 'offline' : ''}`}></span>
+                  <span>{liveState}</span>
+                </div>
+              </div>
+            </div>
+          </nav>
+
+          <main className="container-fluid px-4">
+            <div className="row g-3 mb-4">
+              <MetricCard label="Total Transactions" value={(stats.total_transactions || 0).toLocaleString()} subtext={`${stats.tx_per_minute || 0} tx/min`} tone="border-success" />
+              <MetricCard label="Fraud Alerts" value={(stats.total_alerts || 0).toLocaleString()} subtext={`${stats.alerts_last_hour || 0} last hour`} tone="border-danger" />
+              <MetricCard label="Fraud Rate" value={`${(stats.fraud_rate_pct || 0).toFixed(2)}%`} subtext="of all transactions" tone="border-warning" />
+              <MetricCard label="Alerts / Min" value={stats.alerts_last_minute || 0} subtext="last 60 seconds" />
+              <MetricCard label="Avg Confidence" value={`${(confidence * 100).toFixed(1)}%`} subtext="ML ensemble score" />
+              <MetricCard label="Graph Confirmed" value={graphConfirmed.length} subtext="pattern verified" />
+            </div>
+
+            <div className="row g-3 mb-4">
+              <div className="col-12 col-xl-8">
+                <div className="glass-card rounded-4 p-3 p-md-4 h-100">
+                  <div className="d-flex align-items-center justify-content-between mb-3">
+                    <div>
+                      <h5 className="mb-1">Transaction Volume vs Fraud Alerts</h5>
+                      <div className="small subtle">Live timeline from the analytics store</div>
+                    </div>
+                  </div>
+                  <div className="chart-box">
+                    <canvas ref={timelineCanvasRef}></canvas>
+                  </div>
+                </div>
+              </div>
+              <div className="col-12 col-xl-4">
+                <div className="glass-card rounded-4 p-3 p-md-4 h-100">
+                  <div className="d-flex align-items-center justify-content-between mb-3">
+                    <div>
+                      <h5 className="mb-1">Fraud Pattern Breakdown</h5>
+                      <div className="small subtle">Cycles, rings, bursts, and other patterns</div>
+                    </div>
+                  </div>
+                  <div className="chart-box">
+                    <canvas ref={patternCanvasRef}></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="row g-3">
+              <div className="col-12 col-xl-7">
+                <div className="glass-card rounded-4 p-3 p-md-4 h-100">
+                  <div className="d-flex align-items-center justify-content-between mb-3">
+                    <div>
+                      <h5 className="mb-1">Recent Fraud Alerts</h5>
+                      <div className="small subtle">Latest model or test-mode alerts</div>
+                    </div>
+                    <span className="badge rounded-pill bg-danger">{alerts.length}</span>
+                  </div>
+                  <div className="table-responsive">
+                    <table className="table table-dark table-hover align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Sender</th>
+                          <th>Amount</th>
+                          <th>Confidence</th>
+                          <th>Pattern</th>
+                          <th>Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {alerts.length ? alerts.slice(0, 12).map((alert) => {
+                          const conf = parseFloat(alert.confidence || 0);
+                          const time = alert.created_at ? new Date(alert.created_at).toLocaleTimeString() : '—';
+                          const sender = (alert.sender_id || '').slice(0, 10) + '...';
+                          const pattern = alert.fraud_pattern || 'unknown';
+                          return (
+                            <tr key={alert.transaction_id}>
+                              <td>{sender}</td>
+                              <td className="fw-semibold">{formatCurrency(alert.amount)}</td>
+                              <td className={confidenceClass(conf)}>{(conf * 100).toFixed(0)}%</td>
+                              <td><span className={`badge pattern-badge ${patternClass(pattern)}`}>{pattern}</span></td>
+                              <td>{time}</td>
+                            </tr>
+                          );
+                        }) : (
+                          <tr><td colSpan="5" className="text-center subtle py-4">No alerts yet</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div className="col-12 col-xl-5">
+                <div className="d-flex flex-column gap-3 h-100">
+                  <div className="glass-card rounded-4 p-3 p-md-4 flex-fill">
+                    <h5 className="mb-3">Model Performance</h5>
+                    <div className="mb-3">
+                      <div className="d-flex justify-content-between small subtle mb-1"><span>Random Forest</span><span>{(rf * 100).toFixed(1)}%</span></div>
+                      <div className="progress bg-dark border soft-border" style={{ height: '8px' }}>
+                        <div className="progress-bar bg-success" style={{ width: `${rf * 100}%` }}></div>
+                      </div>
+                    </div>
+                    <div className="mb-3">
+                      <div className="d-flex justify-content-between small subtle mb-1"><span>XGBoost</span><span>{(xgb * 100).toFixed(1)}%</span></div>
+                      <div className="progress bg-dark border soft-border" style={{ height: '8px' }}>
+                        <div className="progress-bar bg-warning" style={{ width: `${xgb * 100}%` }}></div>
+                      </div>
+                    </div>
+                    <div className="d-flex justify-content-between py-2 border-bottom divider">
+                      <span className="subtle">True Positives</span>
+                      <strong>{model.true_positives || 0}</strong>
+                    </div>
+                    <div className="d-flex justify-content-between py-2">
+                      <span className="subtle">False Positives</span>
+                      <strong className="text-danger">{model.false_positives || 0}</strong>
+                    </div>
+                  </div>
+
+                  <div className="glass-card rounded-4 p-3 p-md-4 flex-fill">
+                    <h5 className="mb-1">Last Graph Scan</h5>
+                    <div className="small subtle mb-3">Updated from the graph scheduler</div>
+                    <div className="mb-3 small subtle">
+                      {scan && scan.scanned_at ? `Last scan: ${new Date(scan.scanned_at).toLocaleTimeString()}` : 'Never run'}
+                    </div>
+                    <div className="row g-3 text-center">
+                      <div className="col-6">
+                        <div className="glass-card rounded-4 p-3 border soft-border">
+                          <div className="metric-value">{scan?.cycles_found || 0}</div>
+                          <div className="small subtle mt-1">Cycles</div>
+                        </div>
+                      </div>
+                      <div className="col-6">
+                        <div className="glass-card rounded-4 p-3 border soft-border">
+                          <div className="metric-value">{scan?.communities_found || 0}</div>
+                          <div className="small subtle mt-1">Rings</div>
+                        </div>
+                      </div>
+                      <div className="col-6">
+                        <div className="glass-card rounded-4 p-3 border soft-border">
+                          <div className="metric-value">{scan?.bursts_found || 0}</div>
+                          <div className="small subtle mt-1">Bursts</div>
+                        </div>
+                      </div>
+                      <div className="col-6">
+                        <div className="glass-card rounded-4 p-3 border soft-border">
+                          <div className="metric-value">{scan?.hubs_found || 0}</div>
+                          <div className="small subtle mt-1">Hubs</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <footer className="text-center small subtle py-4">
+              Real-Time Graph-Based Financial Fraud Detection &middot; Kafka &middot; Neo4j &middot; SQLite &middot; React &middot; Bootstrap
+            </footer>
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
